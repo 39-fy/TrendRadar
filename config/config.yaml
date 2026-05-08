@@ -27,6 +27,17 @@ crawler:
 report:
   mode: "daily" # 可选: "daily"|"incremental"|"current"
   rank_threshold: 5 # 排名高亮阈值
+  max_titles_per_group: 5 # 每个关键词/AI分组最多推送的新闻条数
+
+ai:
+  enabled: true # 是否启用 AI 增强；API Key 通过 GitHub Secret 的 AI_API_KEY 提供
+  api_base_url: "https://ai.ltcraft.cn" # OpenAI 兼容接口地址
+  model: "opus 4.7" # 中转站模型名
+  relevance_enabled: true # 开启 AI 智能筛选；失败时自动回退到关键词筛选
+  summary_enabled: true # 开启 AI 晚间总结
+  summary_hours: [21] # 只在北京时间 21 点生成 AI 总结
+  max_titles_for_ai: 120 # 每次最多送给 AI 判断的候选新闻数，避免请求过大
+  interest_prompt: "关注 AI 产品、智能体、大模型、AI 办公、AI 搜索、工作流、agent、RAG、企业 AI、具身智能、机器人相关热点。优先选择适合 AI 产品经理选题、产品趋势分析、企业应用观察的新闻。排除招聘、培训课、纯娱乐八卦、无产品/技术/行业价值的内容。"
 
 notification:
   enable_notification: true # 是否启用通知功能，如果 false，则不发送手机通知
@@ -42,7 +53,7 @@ notification:
   #   - 只想在工作日白天接收推送（如 09:00-18:00）
   #   - 希望在晚上固定时间收到汇总（如 20:00-22:00）
   push_window:
-    enabled: false  # 是否启用推送时间窗口控制，默认关闭
+    enabled: false  # GitHub Actions 已按固定时间运行，这里保持关闭
     # 注意：GitHub Actions 执行时间不稳定，时间范围建议至少留足 2 小时
     # 如果想要精准的定时推送，建议使用 Docker 部署在个人服务器上
     time_range:

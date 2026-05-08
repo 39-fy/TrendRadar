@@ -72,6 +72,10 @@ def load_config():
         "REPORT_MODE": os.environ.get("REPORT_MODE", "").strip()
         or config_data["report"]["mode"],
         "RANK_THRESHOLD": config_data["report"]["rank_threshold"],
+        "MAX_TITLES_PER_GROUP": int(
+            os.environ.get("MAX_TITLES_PER_GROUP", "").strip() or "0"
+        )
+        or config_data["report"].get("max_titles_per_group", 0),
         "USE_PROXY": config_data["crawler"]["use_proxy"],
         "DEFAULT_PROXY": config_data["crawler"]["default_proxy"],
         "ENABLE_CRAWLER": os.environ.get("ENABLE_CRAWLER", "").strip().lower()
@@ -129,6 +133,31 @@ def load_config():
             "HOTNESS_WEIGHT": config_data["weight"]["hotness_weight"],
         },
         "PLATFORMS": config_data["platforms"],
+    }
+
+    ai_config = config_data.get("ai", {})
+    config["AI"] = {
+        "ENABLED": os.environ.get("AI_ENABLED", "").strip().lower()
+        in ("true", "1")
+        if os.environ.get("AI_ENABLED", "").strip()
+        else ai_config.get("enabled", False),
+        "API_KEY": os.environ.get("AI_API_KEY", "").strip(),
+        "API_BASE_URL": os.environ.get("AI_API_BASE_URL", "").strip()
+        or ai_config.get("api_base_url", ""),
+        "MODEL": os.environ.get("AI_MODEL", "").strip() or ai_config.get("model", ""),
+        "RELEVANCE_ENABLED": os.environ.get(
+            "AI_RELEVANCE_ENABLED", ""
+        ).strip().lower()
+        in ("true", "1")
+        if os.environ.get("AI_RELEVANCE_ENABLED", "").strip()
+        else ai_config.get("relevance_enabled", False),
+        "SUMMARY_ENABLED": os.environ.get("AI_SUMMARY_ENABLED", "").strip().lower()
+        in ("true", "1")
+        if os.environ.get("AI_SUMMARY_ENABLED", "").strip()
+        else ai_config.get("summary_enabled", False),
+        "SUMMARY_HOURS": ai_config.get("summary_hours", [21]),
+        "MAX_TITLES_FOR_AI": int(ai_config.get("max_titles_for_ai", 120)),
+        "INTEREST_PROMPT": ai_config.get("interest_prompt", ""),
     }
 
     # 通知渠道配置（环境变量优先）
@@ -1327,7 +1356,7 @@ def count_word_frequency(
             {
                 "word": group_key,
                 "count": data["count"],
-                "titles": sorted_titles,
+                "titles": limit_titles_for_display(sorted_titles),
                 "percentage": (
                     round(data["count"] / total_titles * 100, 2)
                     if total_titles > 0
@@ -1338,6 +1367,311 @@ def count_word_frequency(
 
     stats.sort(key=lambda x: x["count"], reverse=True)
     return stats, total_titles
+
+
+def limit_titles_for_display(titles: List[Dict]) -> List[Dict]:
+    """限制每个分组推送的新闻条数，0 表示不限制"""
+    max_titles = CONFIG.get("MAX_TITLES_PER_GROUP", 0)
+    if max_titles and max_titles > 0:
+        return titles[:max_titles]
+    return titles
+
+
+def get_ai_chat_completions_url() -> str:
+    """获取 OpenAI 兼容的 chat completions 接口地址"""
+    base_url = CONFIG["AI"]["API_BASE_URL"].rstrip("/")
+    if base_url.endswith("/chat/completions"):
+        return base_url
+    if base_url.endswith("/v1"):
+        return f"{base_url}/chat/completions"
+    return f"{base_url}/v1/chat/completions"
+
+
+def is_ai_ready(feature_key: str) -> bool:
+    """检查 AI 功能是否可用"""
+    ai_config = CONFIG.get("AI", {})
+    return bool(
+        ai_config.get("ENABLED")
+        and ai_config.get(feature_key)
+        and ai_config.get("API_KEY")
+        and ai_config.get("API_BASE_URL")
+        and ai_config.get("MODEL")
+    )
+
+
+def call_ai(messages: List[Dict], max_tokens: int = 1200) -> Optional[str]:
+    """调用 OpenAI 兼容模型；失败时返回 None，保证主流程回退到关键词结果"""
+    headers = {
+        "Authorization": f"Bearer {CONFIG['AI']['API_KEY']}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": CONFIG["AI"]["MODEL"],
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+    }
+
+    try:
+        response = requests.post(
+            get_ai_chat_completions_url(), headers=headers, json=payload, timeout=60
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"AI 调用失败，自动回退到关键词结果: {e}")
+        return None
+
+
+def extract_json_object(text: str) -> Optional[Dict]:
+    """从模型回复中提取 JSON 对象"""
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return None
+
+
+def make_title_item(
+    source_id: str,
+    title: str,
+    title_data: Dict,
+    id_to_name: Dict,
+    title_info: Optional[Dict],
+    rank_threshold: int,
+    is_new: bool = False,
+) -> Dict:
+    """把原始标题数据转成推送分组里的统一结构"""
+    ranks = title_data.get("ranks", []) or [99]
+    url = title_data.get("url", "")
+    mobile_url = title_data.get("mobileUrl", "")
+    first_time = ""
+    last_time = ""
+    count_info = 1
+
+    if title_info and source_id in title_info and title in title_info[source_id]:
+        info = title_info[source_id][title]
+        first_time = info.get("first_time", "")
+        last_time = info.get("last_time", "")
+        count_info = info.get("count", 1)
+        ranks = info.get("ranks") or ranks
+        url = info.get("url", url)
+        mobile_url = info.get("mobileUrl", mobile_url)
+
+    return {
+        "title": title,
+        "source_name": id_to_name.get(source_id, source_id),
+        "first_time": first_time,
+        "last_time": last_time,
+        "time_display": format_time_display(first_time, last_time),
+        "count": count_info,
+        "ranks": ranks,
+        "rank_threshold": rank_threshold,
+        "url": url,
+        "mobileUrl": mobile_url,
+        "is_new": is_new,
+    }
+
+
+def append_ai_relevance_group(
+    stats: List[Dict],
+    data_source: Dict,
+    id_to_name: Dict,
+    title_info: Optional[Dict],
+    rank_threshold: int,
+    total_titles: int,
+) -> List[Dict]:
+    """追加 AI 智能筛选分组；失败时不影响关键词筛选结果"""
+    if not is_ai_ready("RELEVANCE_ENABLED"):
+        return stats
+
+    candidates = []
+    for source_id, titles_data in data_source.items():
+        for title, title_data in titles_data.items():
+            ranks = title_data.get("ranks", []) or [99]
+            candidates.append(
+                {
+                    "source_id": source_id,
+                    "source_name": id_to_name.get(source_id, source_id),
+                    "title": title,
+                    "title_data": title_data,
+                    "best_rank": min(ranks) if ranks else 999,
+                }
+            )
+
+    candidates = sorted(candidates, key=lambda x: x["best_rank"])[
+        : CONFIG["AI"]["MAX_TITLES_FOR_AI"]
+    ]
+    if not candidates:
+        return stats
+
+    numbered_titles = "\n".join(
+        f'{i + 1}. [{item["source_name"]}] {item["title"]}'
+        for i, item in enumerate(candidates)
+    )
+    prompt = f"""
+你是 AI 产品经理的热点筛选助手。请从候选热搜里选出最相关、最有选题价值的新闻。
+
+关注范围：
+{CONFIG["AI"]["INTEREST_PROMPT"]}
+
+候选新闻：
+{numbered_titles}
+
+只返回 JSON，格式：
+{{"relevant_indexes":[1,2,3]}}
+最多选择 {CONFIG.get("MAX_TITLES_PER_GROUP", 5)} 条。
+"""
+    content = call_ai(
+        [
+            {"role": "system", "content": "你只输出合法 JSON，不输出解释。"},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=600,
+    )
+    if not content:
+        return stats
+
+    parsed = extract_json_object(content)
+    if not parsed or not isinstance(parsed.get("relevant_indexes"), list):
+        print("AI 筛选返回格式无法解析，自动回退到关键词结果")
+        return stats
+
+    selected_items = []
+    seen_titles = set()
+    for index in parsed["relevant_indexes"]:
+        if not isinstance(index, int) or index < 1 or index > len(candidates):
+            continue
+        candidate = candidates[index - 1]
+        title = candidate["title"]
+        if title in seen_titles:
+            continue
+        seen_titles.add(title)
+        selected_items.append(
+            make_title_item(
+                candidate["source_id"],
+                title,
+                candidate["title_data"],
+                id_to_name,
+                title_info,
+                rank_threshold,
+            )
+        )
+
+    if not selected_items:
+        return stats
+
+    selected_items = limit_titles_for_display(
+        sorted(
+            selected_items,
+            key=lambda x: (
+                -calculate_news_weight(x, rank_threshold),
+                min(x["ranks"]) if x["ranks"] else 999,
+                -x["count"],
+            ),
+        )
+    )
+    stats.append(
+        {
+            "word": "AI智能筛选",
+            "count": len(selected_items),
+            "titles": selected_items,
+            "percentage": round(len(selected_items) / total_titles * 100, 2)
+            if total_titles > 0
+            else 0,
+        }
+    )
+    stats.sort(key=lambda x: x["count"], reverse=True)
+    return stats
+
+
+def should_send_ai_summary() -> bool:
+    """仅在配置的北京时间小时发送 AI 总结"""
+    if not is_ai_ready("SUMMARY_ENABLED"):
+        return False
+    return get_beijing_time().hour in CONFIG["AI"].get("SUMMARY_HOURS", [21])
+
+
+def build_ai_summary_text(stats: List[Dict], report_type: str) -> Optional[str]:
+    """生成晚间 AI 总结文本"""
+    if not should_send_ai_summary():
+        return None
+
+    lines = []
+    for stat in stats:
+        if stat["count"] <= 0:
+            continue
+        lines.append(f"【{stat['word']}】共 {stat['count']} 条")
+        for item in stat["titles"][: CONFIG.get("MAX_TITLES_PER_GROUP", 5)]:
+            lines.append(f"- [{item['source_name']}] {item['title']}")
+
+    if not lines:
+        return None
+
+    prompt = f"""
+请基于下面的 TrendRadar 热点，写一份给 AI 产品经理看的晚间简报。
+
+要求：
+1. 先用 3-5 条概括今天值得注意的 AI/产品/企业应用趋势。
+2. 再给 3 个适合写文章或做选题的方向。
+3. 最后列出需要继续观察的信号。
+4. 简洁，中文，不要夸张。
+
+报告类型：{report_type}
+热点数据：
+{chr(10).join(lines)}
+"""
+    return call_ai(
+        [
+            {"role": "system", "content": "你是擅长 AI 产品趋势分析的产品顾问。"},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=1600,
+    )
+
+
+def send_ai_summary_to_feishu(
+    summary_text: str, report_type: str, proxy_url: Optional[str] = None
+) -> bool:
+    """将 AI 总结作为单独消息发送到飞书"""
+    feishu_url = CONFIG["FEISHU_WEBHOOK_URL"]
+    if not feishu_url:
+        return False
+
+    headers = {"Content-Type": "application/json"}
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    now = get_beijing_time()
+    payload = {
+        "msg_type": "text",
+        "content": {
+            "total_titles": 0,
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "report_type": f"{report_type} AI总结",
+            "text": f"**TrendRadar AI 晚间总结**\n\n{summary_text}",
+        },
+    }
+    try:
+        response = requests.post(
+            feishu_url, headers=headers, json=payload, proxies=proxies, timeout=30
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("StatusCode") == 0 or result.get("code") == 0:
+            print("飞书 AI 总结发送成功")
+            return True
+        print(f"飞书 AI 总结发送失败: {result}")
+        return False
+    except Exception as e:
+        print(f"飞书 AI 总结发送出错: {e}")
+        return False
 
 
 # === 报告生成 ===
@@ -4220,6 +4554,14 @@ class NewsAnalyzer:
             new_titles,
             mode=mode,
         )
+        stats = append_ai_relevance_group(
+            stats,
+            data_source,
+            id_to_name,
+            title_info,
+            self.rank_threshold,
+            total_titles,
+        )
 
         # HTML生成
         html_file = generate_html_report(
@@ -4264,6 +4606,9 @@ class NewsAnalyzer:
                 mode=mode,
                 html_file_path=html_file_path,
             )
+            ai_summary = build_ai_summary_text(stats, report_type)
+            if ai_summary:
+                send_ai_summary_to_feishu(ai_summary, report_type, self.proxy_url)
             return True
         elif CONFIG["ENABLE_NOTIFICATION"] and not has_notification:
             print("⚠️ 警告：通知功能已启用但未配置任何通知渠道，将跳过通知发送")
