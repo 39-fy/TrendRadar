@@ -32,7 +32,7 @@ report:
 ai:
   enabled: true # 是否启用 AI 增强；API Key 通过 GitHub Secret 的 AI_API_KEY 提供
   api_base_url: "https://ai.ltcraft.cn" # OpenAI 兼容接口地址
-  model: "opus 4.7" # 中转站模型名
+  model: "claude-opus-4-7" # 中转站模型名
   relevance_enabled: true # 开启 AI 智能筛选；失败时自动回退到关键词筛选
   summary_enabled: true # 开启 AI 晚间总结
   summary_hours: [21] # 只在北京时间 21 点生成 AI 总结
