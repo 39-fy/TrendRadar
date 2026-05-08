@@ -7,6 +7,7 @@ import re
 import time
 import webbrowser
 import smtplib
+import xml.etree.ElementTree as ET
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
@@ -133,6 +134,7 @@ def load_config():
             "HOTNESS_WEIGHT": config_data["weight"]["hotness_weight"],
         },
         "PLATFORMS": config_data["platforms"],
+        "RSS_FEEDS": config_data.get("rss_feeds", []),
     }
 
     ai_config = config_data.get("ai", {})
@@ -526,9 +528,74 @@ class DataFetcher:
                     return None, id_value, alias
         return None, id_value, alias
 
+    @staticmethod
+    def _xml_text(element, paths: List[str]) -> str:
+        """Return the first non-empty text found for RSS/Atom paths."""
+        for path in paths:
+            found = element.find(path)
+            if found is not None and found.text:
+                return found.text.strip()
+        return ""
+
+    @staticmethod
+    def _xml_link(element) -> str:
+        link = DataFetcher._xml_text(element, ["link"])
+        if link:
+            return link
+
+        for found in element.findall("{http://www.w3.org/2005/Atom}link"):
+            href = found.attrib.get("href", "").strip()
+            if href:
+                return href
+
+        return ""
+
+    def fetch_rss_feed(self, feed_config: Dict) -> Optional[Dict]:
+        """Fetch a custom RSS/Atom feed and convert it to NewsNow-like data."""
+        feed_id = feed_config.get("id", "rss")
+        feed_url = feed_config.get("url", "")
+        limit = int(feed_config.get("limit", 20))
+
+        if not feed_url:
+            print(f"RSS源 {feed_id} 未配置 url")
+            return None
+
+        try:
+            response = requests.get(
+                feed_url,
+                headers={
+                    "User-Agent": "TrendRadar/3.0.5 (+https://github.com/39-fy/TrendRadar)",
+                    "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml",
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+
+            items = root.findall(".//item")
+            if not items:
+                items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+
+            parsed_items = []
+            for item in items[:limit]:
+                title = self._xml_text(
+                    item, ["title", "{http://www.w3.org/2005/Atom}title"]
+                )
+                url = self._xml_link(item)
+                if title:
+                    parsed_items.append(
+                        {"title": title, "url": url, "mobileUrl": url}
+                    )
+
+            print(f"获取 RSS源 {feed_id} 成功，共 {len(parsed_items)} 条")
+            return {"status": "success", "items": parsed_items}
+        except Exception as e:
+            print(f"请求 RSS源 {feed_id} 失败: {e}")
+            return None
+
     def crawl_websites(
         self,
-        ids_list: List[Union[str, Tuple[str, str]]],
+        ids_list: List[Union[str, Tuple[str, str], Dict]],
         request_interval: int = CONFIG["REQUEST_INTERVAL"],
     ) -> Tuple[Dict, Dict, List]:
         """爬取多个网站数据"""
@@ -537,18 +604,27 @@ class DataFetcher:
         failed_ids = []
 
         for i, id_info in enumerate(ids_list):
-            if isinstance(id_info, tuple):
+            if isinstance(id_info, dict):
+                id_value = id_info["id"]
+                name = id_info.get("name", id_value)
+                source_type = id_info.get("type", "newsnow")
+            elif isinstance(id_info, tuple):
                 id_value, name = id_info
+                source_type = "newsnow"
             else:
                 id_value = id_info
                 name = id_value
+                source_type = "newsnow"
 
             id_to_name[id_value] = name
-            response, _, _ = self.fetch_data(id_info)
+            if source_type == "rss":
+                data = self.fetch_rss_feed(id_info)
+            else:
+                response, _, _ = self.fetch_data(id_info)
+                data = json.loads(response) if response else None
 
-            if response:
+            if data:
                 try:
-                    data = json.loads(response)
                     results[id_value] = {}
                     for index, item in enumerate(data.get("items", []), 1):
                         title = item["title"]
@@ -4478,7 +4554,7 @@ class NewsAnalyzer:
         try:
             # 获取当前配置的监控平台ID列表
             current_platform_ids = []
-            for platform in CONFIG["PLATFORMS"]:
+            for platform in CONFIG["PLATFORMS"] + CONFIG.get("RSS_FEEDS", []):
                 current_platform_ids.append(platform["id"])
 
             print(f"当前监控平台: {current_platform_ids}")
@@ -4732,9 +4808,11 @@ class NewsAnalyzer:
                 ids.append((platform["id"], platform["name"]))
             else:
                 ids.append(platform["id"])
+        ids.extend(CONFIG.get("RSS_FEEDS", []))
 
+        configured_sources = CONFIG["PLATFORMS"] + CONFIG.get("RSS_FEEDS", [])
         print(
-            f"配置的监控平台: {[p.get('name', p['id']) for p in CONFIG['PLATFORMS']]}"
+            f"配置的监控平台: {[p.get('name', p['id']) for p in configured_sources]}"
         )
         print(f"开始爬取数据，请求间隔 {self.request_interval} 毫秒")
         ensure_directory_exists("output")
@@ -4753,7 +4831,10 @@ class NewsAnalyzer:
     ) -> Optional[str]:
         """执行模式特定逻辑"""
         # 获取当前监控平台ID列表
-        current_platform_ids = [platform["id"] for platform in CONFIG["PLATFORMS"]]
+        current_platform_ids = [
+            platform["id"]
+            for platform in CONFIG["PLATFORMS"] + CONFIG.get("RSS_FEEDS", [])
+        ]
 
         new_titles = detect_latest_new_titles(current_platform_ids)
         time_info = Path(save_titles_to_file(results, id_to_name, failed_ids)).stem
